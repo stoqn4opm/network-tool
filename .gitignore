@@ -1,0 +1,10 @@
+.DS_Store
+*.pyc
+__pycache__/
+
+# Runtime data lives in ~/.network-tool, never in the repo. These patterns just
+# guard against stray captures/tokens accidentally landing here.
+*.flows
+*.jsonl
+*.har
+*.pid

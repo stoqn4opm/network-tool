@@ -1,0 +1,465 @@
+#!/bin/bash
+#
+# ntool — agent-drivable mitmproxy wrapper for capturing iOS + web API traffic.
+# See README.md. macOS bash 3.2 safe; no set -e (many optional lookups).
+
+NTOOL_VERSION="0.1.0"
+
+# MARK: - Path resolution (installed via Homebrew, or run from a git checkout)
+
+# @@LIBEXEC@@ is rewritten by the formula's inreplace at install time.
+NTOOL_LIBEXEC="${NTOOL_LIBEXEC:-@@LIBEXEC@@}"
+_self_dir="$(cd "$(dirname "$0")" && pwd)"
+if [ ! -f "$NTOOL_LIBEXEC/common.sh" ] && [ -f "$_self_dir/../libexec/common.sh" ]; then
+  NTOOL_LIBEXEC="$(cd "$_self_dir/../libexec" && pwd)"
+fi
+[ -f "$NTOOL_LIBEXEC/common.sh" ] || { echo "error: cannot find libexec ($NTOOL_LIBEXEC)" >&2; exit 1; }
+
+# shellcheck source=/dev/null
+. "$NTOOL_LIBEXEC/common.sh"
+
+READER="$NTOOL_LIBEXEC/flow_read.py"
+PICK="$NTOOL_LIBEXEC/pick_flow.py"
+FRESHEN="$NTOOL_LIBEXEC/freshen.py"
+# Addon lives in libexec (installed) or ../addons (checkout).
+ADDON="$NTOOL_LIBEXEC/capture.py"
+[ -f "$ADDON" ] || ADDON="$_self_dir/../addons/capture.py"
+
+_read() { /usr/bin/python3 "$READER" "$@"; }
+
+# session name -> jsonl path (captures/NAME.jsonl, or sessions/NAME/*.jsonl)
+session_jsonl() {
+  local name="${1:-live}"
+  if [ -f "$CAPTURES_DIR/$name.jsonl" ]; then
+    echo "$CAPTURES_DIR/$name.jsonl"
+  elif [ -f "$SESSIONS_DIR/$name/$name.jsonl" ]; then
+    echo "$SESSIONS_DIR/$name/$name.jsonl"
+  else
+    echo "$CAPTURES_DIR/$name.jsonl"
+  fi
+}
+session_flows() {
+  local name="${1:-live}"
+  if [ -f "$CAPTURES_DIR/$name.flows" ]; then
+    echo "$CAPTURES_DIR/$name.flows"
+  else
+    echo "$SESSIONS_DIR/$name/$name.flows"
+  fi
+}
+
+capture_running() {
+  [ -f "$PID_FILE" ] || return 1
+  local pid; pid="$(cat "$PID_FILE" 2>/dev/null)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# MARK: - setup
+
+cmd_setup() {
+  local do_sim=0 do_browser=0
+  if [ $# -eq 0 ]; then do_sim=1; do_browser=1; fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --sim) do_sim=1 ;;
+      --browser) do_browser=1 ;;
+      *) die "setup: unknown flag $1" ;;
+    esac
+    shift
+  done
+  require_mitmproxy
+  ensure_ca
+  ensure_dirs
+  [ -f "$RULES_FILE" ] || echo "[]" > "$RULES_FILE"
+
+  if [ $do_sim -eq 1 ]; then
+    local udid; udid="$(booted_udid)"
+    [ -n "$udid" ] || die "no booted simulator (boot one, then rerun: ntool setup --sim)"
+    xcrun simctl keychain "$udid" add-root-cert "$NTOOL_CA" \
+      && log "✓ trusted mitmproxy CA in simulator $udid" \
+      || die "failed to trust CA in simulator"
+  fi
+  if [ $do_browser -eq 1 ]; then
+    log "trusting mitmproxy CA system-wide (Safari/Chrome) — needs your password:"
+    sudo security add-trusted-cert -d -r trustRoot \
+      -k /Library/Keychains/System.keychain "$NTOOL_CA" \
+      && log "✓ trusted mitmproxy CA system-wide" \
+      || log "! system-wide trust failed (browsers may reject interception)"
+  fi
+  log ""
+  log "note: the first '--mode local' capture asks macOS to approve mitmproxy's"
+  log "      network extension once (System Settings ▸ Network ▸ Filters). Approve it."
+}
+
+# MARK: - doctor
+
+cmd_doctor() {
+  _bold "network-tool doctor"
+  if command -v mitmdump >/dev/null 2>&1; then
+    echo "mitmproxy : $(mitmdump --version 2>/dev/null | head -1)"
+  else
+    echo "mitmproxy : NOT INSTALLED (brew install --cask mitmproxy)"
+  fi
+  echo "CA        : $([ -f "$NTOOL_CA" ] && echo "$NTOOL_CA" || echo 'missing (run: ntool setup)')"
+  local udid; udid="$(booted_udid)"
+  echo "booted sim: ${udid:-none}"
+  echo "home      : $NTOOL_HOME"
+  echo "addon     : $ADDON"
+  echo "reader    : $READER"
+  if capture_running; then
+    echo "capture   : RUNNING (pid $(cat "$PID_FILE"))  [$(cat "$META_FILE" 2>/dev/null | tr '\n' ' ')]"
+  else
+    echo "capture   : idle"
+  fi
+  echo "proxy state (active services):"
+  active_services | while IFS= read -r svc; do
+    local s; s="$(networksetup -getsecurewebproxy "$svc" 2>/dev/null | awk -F': ' '/^Enabled/{e=$2}/^Server/{sv=$2}/^Port/{p=$2}END{print e" "sv":"p}')"
+    echo "  $svc -> https proxy: $s"
+  done
+}
+
+# MARK: - system proxy (fallback routing)
+
+_proxy_fields() { # <service> <kind: ""|secure>
+  networksetup -get"${2}"webproxy "$1" 2>/dev/null \
+    | awk -F': ' '/^Enabled/{e=$2}/^Server/{s=$2}/^Port/{p=$2}END{print e"|"s"|"p}'
+}
+
+proxy_on() {
+  : > "$META_FILE"
+  echo "mode=proxy" >> "$META_FILE"
+  active_services | while IFS= read -r svc; do
+    echo "svc=$svc|$(_proxy_fields "$svc" "")|$(_proxy_fields "$svc" "secure")" >> "$META_FILE"
+  done
+  log "routing system proxy through 127.0.0.1:$NTOOL_PORT (needs your password)…"
+  active_services | while IFS= read -r svc; do
+    sudo networksetup -setwebproxy "$svc" 127.0.0.1 "$NTOOL_PORT"
+    sudo networksetup -setsecurewebproxy "$svc" 127.0.0.1 "$NTOOL_PORT"
+  done
+  log "! restart the Simulator so it picks up the new proxy."
+}
+
+proxy_restore() {
+  [ -f "$META_FILE" ] || return 0
+  grep '^svc=' "$META_FILE" 2>/dev/null | while IFS= read -r line; do
+    local body svc web sec we ws wp se ss sp
+    body="${line#svc=}"
+    svc="${body%%|*}"; body="${body#*|}"
+    we="${body%%|*}"; body="${body#*|}"; ws="${body%%|*}"; body="${body#*|}"; wp="${body%%|*}"; body="${body#*|}"
+    se="${body%%|*}"; body="${body#*|}"; ss="${body%%|*}"; body="${body#*|}"; sp="${body}"
+    if [ "$we" = "Yes" ]; then
+      sudo networksetup -setwebproxy "$svc" "$ws" "$wp"
+    else
+      sudo networksetup -setwebproxystate "$svc" off
+    fi
+    if [ "$se" = "Yes" ]; then
+      sudo networksetup -setsecurewebproxy "$svc" "$ss" "$sp"
+    else
+      sudo networksetup -setsecurewebproxystate "$svc" off
+    fi
+  done
+  log "✓ restored previous proxy settings"
+}
+
+# MARK: - capture
+
+cmd_capture() {
+  local action="${1:-}"; shift 2>/dev/null
+  case "$action" in
+    on)  cmd_capture_on "$@" ;;
+    off) cmd_capture_off ;;
+    *)   die "usage: ntool capture on|off" ;;
+  esac
+}
+
+cmd_capture_on() {
+  local session="live" sim="" web="" use_proxy=0 headless=0
+  local filter=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --sim) sim="$2"; shift ;;
+      --web) web="$2"; shift ;;
+      --proxy) use_proxy=1 ;;
+      --headless) headless=1 ;;
+      --session) session="$2"; shift ;;
+      *) filter="${filter:+$filter }$1" ;;
+    esac
+    shift
+  done
+  require_mitmproxy
+  ensure_ca
+  ensure_dirs
+  capture_running && die "already capturing (pid $(cat "$PID_FILE")). Run: ntool capture off"
+
+  local flows="$CAPTURES_DIR/$session.flows"
+  local jsonl="$CAPTURES_DIR/$session.jsonl"
+  : > "$jsonl"; rm -f "$flows"
+
+  local mode client
+  if [ $use_proxy -eq 1 ]; then
+    mode="regular"; client="system"
+    proxy_on
+  elif [ -n "$web" ]; then
+    mode="local:$web"; client="web:$web"
+  elif [ -n "$sim" ]; then
+    mode="local:$sim"; client="sim:$sim"
+  else
+    mode="local"; client="local"
+    log "note: no --sim/--web/--proxy given — capturing ALL local processes."
+  fi
+
+  export NTOOL_HOME NTOOL_SESSION="$session" NTOOL_CLIENT="$client" NTOOL_RULES="$RULES_FILE"
+  local logf="$CAPTURES_DIR/$session.log"
+  local front
+  if [ $headless -eq 1 ]; then front="mitmdump"; else front="mitmweb"; fi
+
+  # Build arg list (bash 3.2: use a plain array).
+  local args
+  args=( -p "$NTOOL_PORT" --mode "$mode" -s "$ADDON" -w "$flows" )
+  if [ "$front" = "mitmweb" ]; then
+    args=( --set web_open_browser=false --set web_port="$NTOOL_WEB_PORT" "${args[@]}" )
+  fi
+  [ -n "$filter" ] && args=( "${args[@]}" "$filter" )
+
+  nohup "$front" "${args[@]}" >"$logf" 2>&1 &
+  echo $! > "$PID_FILE"
+  echo "session=$session" >> "$META_FILE"
+
+  sleep 1
+  if ! capture_running; then
+    log "capture failed to start — last log lines:"; tail -5 "$logf" >&2; rm -f "$PID_FILE"; return 1
+  fi
+  _bold "capturing → session '$session'"
+  echo "  mode    : $mode   ($client)"
+  echo "  proxy   : 127.0.0.1:$NTOOL_PORT"
+  [ "$front" = "mitmweb" ] && echo "  live UI : http://127.0.0.1:$NTOOL_WEB_PORT  (watch traffic here)"
+  echo "  stop    : ntool capture off"
+  echo "  inspect : ntool list   |   ntool show <id>"
+}
+
+cmd_capture_off() {
+  if capture_running; then
+    kill "$(cat "$PID_FILE")" 2>/dev/null
+    sleep 1
+    kill -9 "$(cat "$PID_FILE")" 2>/dev/null
+    log "✓ capture stopped"
+  else
+    log "no capture running"
+  fi
+  rm -f "$PID_FILE"
+  if grep -q '^mode=proxy' "$META_FILE" 2>/dev/null; then
+    proxy_restore
+  fi
+  rm -f "$META_FILE"
+}
+
+# MARK: - inspect (list / show / export)
+
+_resolve_session_flag() { # consumes --session NAME from args, echoes name; prints rest to fd
+  :  # handled inline in each command below
+}
+
+cmd_list() {
+  local session="live"; local pass=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --session) session="$2"; shift ;;
+      *) pass="${pass:+$pass }$1" ;;
+    esac
+    shift
+  done
+  # shellcheck disable=SC2086
+  _read list "$(session_jsonl "$session")" $pass
+}
+
+cmd_show() {
+  local session="live" id="" raw=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --session) session="$2"; shift ;;
+      --raw) raw="--raw" ;;
+      *) id="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$id" ] || die "usage: ntool show <id> [--raw] [--session NAME]"
+  _read show "$(session_jsonl "$session")" "$id" $raw
+}
+
+cmd_hosts() {
+  [ -f "$HOSTS_FILE" ] && cat "$HOSTS_FILE" || log "(no hosts discovered yet)"
+}
+
+# MARK: - rules
+
+cmd_rules() {
+  ensure_dirs
+  [ -f "$RULES_FILE" ] || echo "[]" > "$RULES_FILE"
+  case "${1:-show}" in
+    show)  cat "$RULES_FILE" ;;
+    path)  echo "$RULES_FILE" ;;
+    clear) echo "[]" > "$RULES_FILE"; log "✓ cleared overrides" ;;
+    edit)  "${EDITOR:-vi}" "$RULES_FILE" ;;
+    set)
+      shift
+      [ -n "${1:-}" ] || die "usage: ntool rules set '<json-array>'"
+      printf '%s' "$1" | /usr/bin/python3 -c 'import json,sys; json.load(sys.stdin)' \
+        || die "invalid JSON"
+      printf '%s\n' "$1" > "$RULES_FILE"
+      log "✓ wrote $(printf '%s' "$1" | /usr/bin/python3 -c 'import json,sys;print(len(json.load(sys.stdin)))') rule(s)"
+      ;;
+    *) die "usage: ntool rules show|set '<json>'|clear|edit|path" ;;
+  esac
+}
+
+# MARK: - replay
+
+cmd_replay() {
+  local id="" fresh=0 bundle="" session="live"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --fresh-token) fresh=1 ;;
+      --bundle) bundle="$2"; shift ;;
+      --session) session="$2"; shift ;;
+      *) id="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$id" ] || die "usage: ntool replay <id> [--fresh-token] [--bundle <id>]"
+  require_mitmproxy
+  local src; src="$(session_flows "$session")"
+  [ -f "$src" ] || die "no capture flows for session '$session'"
+
+  local one; one="$(mktemp -u)_ntool.flows"
+  NTOOL_IN="$src" NTOOL_OUT="$one" NTOOL_PICK="$id" \
+    mitmdump -q -n -s "$PICK" >/dev/null 2>&1
+  [ -s "$one" ] || die "no replayable flow for id '$id' (WebSocket flows can't be replayed)"
+
+  local extra=()
+  if [ $fresh -eq 1 ]; then
+    local host header scheme token
+    host="$(_read show "$(session_jsonl "$session")" "$id" --raw 2>/dev/null | awk 'NR<=3{print}' | grep -Eo '[a-z0-9.-]+\.[a-z]+' | head -1)"
+    case "$host" in
+      *realmen.com*) header="RM-Authentication"; scheme=""; bundle="${bundle:-com.realmen.app}" ;;
+      *) header="Authorization"; scheme="Bearer "; bundle="${bundle:-uk.rmtstech.prismi}" ;;
+    esac
+    token="$(lift_token "$bundle")"
+    [ -n "$token" ] || die "could not lift token from $bundle (is that app signed in on the booted sim?)"
+    export NTOOL_FRESH_TOKEN="$token" NTOOL_FRESH_HEADER="$header" NTOOL_FRESH_SCHEME="$scheme"
+    extra=( -s "$FRESHEN" )
+    log "replaying with fresh token from $bundle ($header)"
+  fi
+
+  : > "$CAPTURES_DIR/replay.jsonl"
+  NTOOL_HOME="$NTOOL_HOME" NTOOL_SESSION="replay" NTOOL_CLIENT="replay" NTOOL_RULES="$NTOOL_HOME/.norules" \
+    mitmdump -q -n -C "$one" -s "$ADDON" "${extra[@]}" --anticache >/dev/null 2>&1
+  rm -f "$one"
+  log "replayed → session 'replay':"
+  _read list "$CAPTURES_DIR/replay.jsonl"
+  log "(details: ntool show <id> --session replay)"
+}
+
+# MARK: - sessions
+
+cmd_session() {
+  ensure_dirs
+  case "${1:-}" in
+    list) ls -1 "$SESSIONS_DIR" 2>/dev/null || true ;;
+    save)
+      local name="${2:-}"; [ -n "$name" ] || die "usage: ntool session save <name>"
+      mkdir -p "$SESSIONS_DIR/$name"
+      cp -f "$CAPTURES_DIR/live.jsonl" "$SESSIONS_DIR/$name/$name.jsonl" 2>/dev/null
+      cp -f "$CAPTURES_DIR/live.flows" "$SESSIONS_DIR/$name/$name.flows" 2>/dev/null
+      log "✓ saved session '$name'"
+      ;;
+    load)
+      local name="${2:-}"; [ -n "$name" ] || die "usage: ntool session load <name>"
+      [ -d "$SESSIONS_DIR/$name" ] || die "no session '$name'"
+      capture_running && die "stop capture first (ntool capture off)"
+      cp -f "$SESSIONS_DIR/$name/$name.jsonl" "$CAPTURES_DIR/live.jsonl" 2>/dev/null
+      cp -f "$SESSIONS_DIR/$name/$name.flows" "$CAPTURES_DIR/live.flows" 2>/dev/null
+      log "✓ loaded '$name' into live (use: ntool list / show / view live)"
+      ;;
+    export)
+      shift
+      local name="live" trim="" raw="" har=0
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --trim) trim="--trim" ;;
+          --raw) raw="--raw" ;;
+          --har) har=1 ;;
+          *) name="$1" ;;
+        esac
+        shift
+      done
+      if [ $har -eq 1 ]; then
+        require_mitmproxy
+        local flows out; flows="$(session_flows "$name")"; out="$NTOOL_HOME/$name.har"
+        [ -f "$flows" ] || die "no flows for session '$name'"
+        if mitmdump -q -n -r "$flows" --set hardump="$out" >/dev/null 2>&1 && [ -f "$out" ]; then
+          log "✓ HAR written → $out (open in Charles)"
+        else
+          die "HAR export failed (this mitmproxy build may lack hardump)"
+        fi
+      else
+        _read export "$(session_jsonl "$name")" $trim $raw
+      fi
+      ;;
+    *) die "usage: ntool session save|load|list|export <name> [--trim|--har|--raw]" ;;
+  esac
+}
+
+# MARK: - view
+
+cmd_view() {
+  local name="${1:-live}"
+  require_mitmproxy
+  local flows; flows="$(session_flows "$name")"
+  [ -f "$flows" ] || die "no flows for session '$name'"
+  nohup mitmweb --set web_open_browser=false --set web_port="$NTOOL_WEB_PORT" \
+    -n -r "$flows" >"$NTOOL_HOME/view.log" 2>&1 &
+  echo $! > "$NTOOL_HOME/view.pid"
+  sleep 1
+  _bold "viewing '$name' (read-only) → http://127.0.0.1:$NTOOL_WEB_PORT"
+  echo "  stop viewer: kill \$(cat $NTOOL_HOME/view.pid)"
+}
+
+# MARK: - help
+
+cmd_help() {
+  cat <<EOF
+ntool $NTOOL_VERSION — capture & manipulate iOS + web API traffic (mitmproxy wrapper)
+
+  ntool setup [--sim] [--browser]     trust the CA (simulator and/or Safari/Chrome)
+  ntool doctor                        environment / status check
+  ntool capture on [--sim <app> | --web <browser>] [--proxy] [--headless] [filter]
+  ntool capture off                   stop capture (restores proxy if used)
+  ntool list [--session N] [--filter S] [-n N] [--raw]
+  ntool show <id> [--raw] [--session N]
+  ntool replay <id> [--fresh-token] [--bundle <id>] [--session N]
+  ntool rules show | set '<json>' | clear | edit | path
+  ntool session save <name> | load <name> | list | export [name] [--trim|--har|--raw]
+  ntool view [session]                open a saved capture in the mitmweb UI (read-only)
+  ntool hosts                         runtime-discovered wss/CDN hosts
+  ntool version
+
+Tokens are masked in output by default; pass --raw to reveal them.
+EOF
+}
+
+# MARK: - Dispatch
+
+case "${1:-help}" in
+  setup)   shift; cmd_setup "$@" ;;
+  doctor)  cmd_doctor ;;
+  capture) shift; cmd_capture "$@" ;;
+  list)    shift; cmd_list "$@" ;;
+  show)    shift; cmd_show "$@" ;;
+  replay)  shift; cmd_replay "$@" ;;
+  rules)   shift; cmd_rules "$@" ;;
+  session) shift; cmd_session "$@" ;;
+  view)    shift; cmd_view "$@" ;;
+  hosts)   cmd_hosts ;;
+  version|--version|-v) echo "ntool $NTOOL_VERSION" ;;
+  help|--help|-h) cmd_help ;;
+  *) die "unknown command '$1' (try: ntool help)" ;;
+esac

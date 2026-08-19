@@ -1,0 +1,27 @@
+[
+  {
+    "_comment": "Rewrite an outgoing request body (merge keys into its JSON).",
+    "match": { "method": "POST", "url": "chat/messages/send" },
+    "action": { "type": "mutate_request", "set_json": { "message": "overridden by ntool" } }
+  },
+  {
+    "_comment": "Fake a response without contacting the server (works even for endpoints that do not exist yet).",
+    "match": { "url": "/config" },
+    "action": { "type": "replace_response", "status": 200, "json": { "isMoodsFeatureEnabled": "1" } }
+  },
+  {
+    "_comment": "Delay matching requests to test slow-network / spinner behaviour.",
+    "match": { "url": "keeponline" },
+    "action": { "type": "delay", "ms": 3000 }
+  },
+  {
+    "_comment": "Force an error status for matching requests.",
+    "match": { "url": "visits" },
+    "action": { "type": "block", "status": 500 }
+  },
+  {
+    "_comment": "Let the real response through, then tweak it (status-conditioned).",
+    "match": { "url": "/api/v1/me", "status": 200 },
+    "action": { "type": "mutate_response", "json": { "premium": true } }
+  }
+]
