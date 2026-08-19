@@ -17,10 +17,13 @@ mitmproxy ships as a Homebrew **cask** (a formula can't auto-install it), and Ho
 
 ```bash
 brew install --cask mitmproxy
-brew tap stoqn4opm/tap && brew trust stoqn4opm/tap
+brew tap stoqn4opm/tap https://github.com/stoqn4opm/network-tool.git
+brew trust stoqn4opm/tap          # Homebrew 6.0 requires trusting third-party taps
 brew install network-tool
 ntool setup
 ```
+
+(The repo doubles as its own Homebrew tap — the `Formula/` directory lives in it, so no separate `homebrew-tap` repo is needed.)
 
 Or without Homebrew (single machine / dev):
 
