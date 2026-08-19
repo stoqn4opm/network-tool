@@ -2,8 +2,8 @@ class NetworkTool < Formula
   desc "Agent-drivable mitmproxy wrapper for capturing iOS and web API traffic"
   homepage "https://github.com/stoqn4opm/network-tool"
   url "https://github.com/stoqn4opm/network-tool/archive/refs/tags/v0.1.0.tar.gz"
-  # Filled in at release time (shasum -a 256 of the tag tarball). Not used by --HEAD.
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  # shasum -a 256 of the v0.1.0 tag tarball. Not used by --HEAD.
+  sha256 "5be87c8b9c982e9d95836485f7cc4a881c229b15c9aab9e3cae472140bd09609"
   license "MIT"
   head "https://github.com/stoqn4opm/network-tool.git", branch: "main"
 
